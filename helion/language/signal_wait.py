@@ -24,10 +24,8 @@ def wait(
     index: list[object] | None = None,
     signal: int = 1,
     update: int | None = None,
-    op: str = "ld",
-    sem: str = "acquire",
     scope: str = "gpu",
-    skip_sync: bool = False,
+    hasSubsequentMemAccess: bool = True,
     as_ptrs: bool = False,
 ) -> None:
     """Wait until all entries of the signal_pad slice are equal to the signal value.
@@ -36,11 +34,9 @@ def wait(
         index: Indices to index into the signal_pad tensor
         signal: the value to wait for
         update: Atomically update the signal_pad tensor with this value once the signal is observed. (default: None)
-        op: The memory op for acquiring the lock (default: 'ld')
-        sem: The memory semantic for acquiring the lock (default: 'acquire')
         scope: The scope of the lock (default: 'gpu')
-        skip_sync: Skip the syncthreads after the wait (default: False)
         as_ptrs: Treat signal_pad as pointers to global memory barriers (default: False)
+        hasSubsequentMemAccess: Whether the wait is followed by a subsequence memory access (default: True)
 
     Returns:
         None
@@ -54,39 +50,13 @@ def _(
     index: list[object] | None = None,
     signal: int = 1,
     update: int | None = None,
-    op: str = "ld",
-    sem: str = "acquire",
     scope: str = "gpu",
-    skip_sync: bool = False,
+    hasSubsequentMemAccess: bool = True,
     as_ptrs: bool = False,
-) -> tuple[torch.Tensor, object, int, int | None, str, str, str, bool, bool]:
+) -> tuple[torch.Tensor, object, int, int | None, str, str, bool, bool]:
     from .tile_proxy import Tile
 
-    valid_ops = {"ld", "atomic_cas"}
-    valid_sems = {"relaxed", "acquire", "acq_rel"}
     valid_scopes = {"sys", "gpu"}
-
-    if op not in valid_ops:
-        raise ValueError(f"Invalid Wait op '{op}'. Must be one of {valid_ops}. ")
-
-    if sem == "release":
-        raise ValueError(
-            f"Do not use '{sem}' for wait patterns. Wait sem must be one of {valid_sems}."
-        )
-
-    if sem not in valid_sems:
-        raise ValueError(
-            f"Invalid memory semantic '{sem}'. Must be one of {valid_sems}."
-        )
-
-    if op == "atomic_cas" and update is None:
-        raise ValueError(
-            f"{op} without an update value. Do you want to use 'ld' instead? "
-        )
-
-    if op == "ld":
-        assert update is None
-        update = 0
 
     if scope not in valid_scopes:
         raise ValueError(f"Invalid scope '{scope}'. Must be one of {valid_scopes}.")
@@ -108,7 +78,7 @@ def _(
     index = Tile._prepare_index(index)
     index = Tile._tiles_to_sizes(index)
 
-    return (signal_pad, index, signal, update, op, sem, scope, skip_sync, as_ptrs)
+    return (signal_pad, index, signal, update, scope, has_subsequent_load, as_ptrs)
 
 
 @_decorators.register_fake(wait)
@@ -117,10 +87,8 @@ def _(
     index: list[object] | None = None,
     signal: int = 1,
     update: int | None = None,
-    op: str = "ld",
-    sem: str = "acquire",
-    scope: str = "sys",
-    skip_sync: bool = False,
+    scope: str = "gpu",
+    hasSubsequentMemAccess: bool = True,
     as_ptrs: bool = False,
 ) -> None:
     return None
@@ -137,18 +105,21 @@ def _(state: CodegenState) -> ast.AST:
     index = state.proxy_arg(1)
     signal = state.proxy_arg(2)
     update = state.proxy_arg(3)
-    op = state.proxy_arg(4)
-    sem = state.proxy_arg(5)
-    scope = state.proxy_arg(6)
-    skip_sync = state.proxy_arg(7)
-    as_ptrs = state.proxy_arg(8)
+    scope = state.proxy_arg(4)
+    has_subsequent_load = state.proxy_arg(5)
+    as_ptrs = state.proxy_arg(6)
 
     assert isinstance(signal_pad, torch.Tensor)
     assert isinstance(index, (list))
 
-    assert type(op) is str
-    assert type(sem) is str
     assert type(scope) is str
+
+    assert type(has_subsequent_load) is bool
+    assert type(as_ptrs) is bool
+
+    sem = "acquire" if has_subsequent_load else "relaxed"
+    op = "atomic_cas" if update is not None else "atomic_xchg"
+    skip_sync = not has_subsequent_load
 
     if as_ptrs:
         bar_tensor_shape = signal_pad.shape
@@ -185,10 +156,9 @@ def signal(
     index: list[object] | None = None,
     signal: int = 1,
     wait_for: int | None = None,
-    op: str = "atomic_xchg",
-    sem: str = "release",
+    op: str | None = None,
     scope: str = "gpu",
-    skip_sync: bool = False,
+    hasPreviousMemAccess: bool = True,
     as_ptrs: bool = False,
 ) -> torch.Tensor:
     """Set the signal_pad slice to the signal value.
@@ -196,11 +166,10 @@ def signal(
         signal_pad: The signal pad to signal
         index: Indices to index into the signal_pad tensor
         signal: the value to send
-        wait_for: The value to wait for before sending the signal. Only valid for op = 'atomic_cas'.
-        op: The memory op for acquiring the lock (default: 'atomic_xchg')
-        sem: The memory semantic for acquiring the lock (default: 'release')
+        wait_for: The value to wait for before sending the signal.
+        op: The operating for updating the lock: "add", "set" (default: "set")
         scope: The scope of the lock (default: 'gpu')
-        skip_sync: Skip the syncthreads before sending signal (default: False)
+        hasPreviousMemAccess: Whether the signal is preceded by a memory access (default: True)
         as_ptrs: Treat signal_pad as pointers to global memory barriers (default: False)
     Returns:
         The old value of the signal_pad slice before the update.
@@ -214,29 +183,21 @@ def _(
     index: list[object] | None = None,
     signal: int = 1,
     wait_for: int | None = None,
-    op: str = "atomic_xchg",
-    sem: str = "release",
+    op: str | None = None,
     scope: str = "gpu",
-    skip_sync: bool = False,
+    hasPreviousMemAccess: bool = True,
     as_ptrs: bool = False,
-) -> tuple[torch.Tensor, object, int, int | None, str, str, str, bool, bool]:
+) -> tuple[torch.Tensor, object, int, int | None, str, str, bool, bool]:
     from .tile_proxy import Tile
 
-    valid_ops = {"atomic_add", "atomic_xchg", "atomic_cas"}
-    valid_sems = {"relaxed", "release", "acq_rel"}
+    valid_ops = {"add", "set"}
     valid_scopes = {"sys", "gpu"}
+
+    if op is None:
+        op = "set"
 
     if op not in valid_ops:
         raise ValueError(f"Invalid signal op '{op}'. Must be one of {valid_ops}. ")
-
-    if op == "atomic_cas" and wait_for is None:
-        raise ValueError(
-            f"{op} without a wait_for value. Do you want to use 'atomic_add' or 'atomic_xchg' instead? "
-        )
-    if op in {"atomic_add", "atomic_xchg"} and wait_for is not None:
-        raise ValueError(
-            f"{op} with a wait_for value. Do you want to use 'atomic_cas' instead? "
-        )
 
     if sem not in valid_sems:
         raise ValueError(
@@ -263,7 +224,16 @@ def _(
     index = Tile._prepare_index(index)
     index = Tile._tiles_to_sizes(index)
 
-    return (signal_pad, index, signal, wait_for, op, sem, scope, skip_sync, as_ptrs)
+    return (
+        signal_pad,
+        index,
+        signal,
+        wait_for,
+        op,
+        scope,
+        hasPreviousMemAccess,
+        as_ptrs,
+    )
 
 
 @_decorators.register_fake(signal)
@@ -272,10 +242,9 @@ def _(
     index: list[object] | None = None,
     signal: int = 1,
     wait_for: int | None = None,
-    op: str = "atomic_xchg",
-    sem: str = "release",
+    op: str | None = None,
     scope: str = "gpu",
-    skip_sync: bool = False,
+    hasPreviousMemAccess: bool = True,
     as_ptrs: bool = False,
 ) -> torch.Tensor:
     if index is None:
@@ -297,17 +266,30 @@ def _(state: CodegenState) -> ast.AST:
     signal = state.proxy_arg(2)
     wait_for = state.proxy_arg(3)
     op = state.proxy_arg(4)
-    sem = state.proxy_arg(5)
-    scope = state.proxy_arg(6)
-    skip_sync = state.proxy_arg(7)
-    as_ptrs = state.proxy_arg(8)
+    scope = state.proxy_arg(5)
+    hasPreviousMemAccess = state.proxy_arg(6)
+    as_ptrs = state.proxy_arg(7)
 
     assert isinstance(signal_pad, torch.Tensor)
     assert isinstance(index, list)
 
     assert type(op) is str
-    assert type(sem) is str
     assert type(scope) is str
+
+    assert type(hasPreviousMemAccess) is bool
+    assert type(as_ptrs) is bool
+
+    sem = "release" if hasPreviousMemAccess else "relaxed"
+    skip_sync = not hasPreviousMemAccess
+
+    if op == "add":
+        op = "atomic_add"
+    elif op == "set":
+        op = "atomic_xchg" if wait_for is None else "atomic_cas"
+    else:
+        raise NotImplementedError(
+            f"Unsupported op '{op}' for send signal on gmem barrier. "
+        )
 
     if as_ptrs:
         bar_tensor_shape = signal_pad.shape
@@ -331,7 +313,7 @@ def _(state: CodegenState) -> ast.AST:
         wait_for_expr = ast.Constant(value=0)
     skip_sync_expr = ast.Constant(value=skip_sync)  # pyright: ignore[reportArgumentType]
 
-    if op == "atomic_cas":
+    if wait_for is not None:
         call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={bar_addrs}, expect=wait_for, update=signal, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not skip_sync))"
         return expr_from_string(
             call_triton_wait_signal,
